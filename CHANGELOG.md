@@ -1,3 +1,7 @@
+# 1.12.0
+- Add parallel flow for processing one task in multiple steps concurrently
+- Add event loop to handlers child process for asyncio
+
 # 1.11.7
 - Update `cffi` version to allow python3.12 support, add `setuptools` to requirements
 

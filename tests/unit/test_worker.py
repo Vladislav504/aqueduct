@@ -50,10 +50,12 @@ def worker():
     def init(batch_size, batch_timeout) -> Tuple[Worker, multiprocessing.Queue]:
         iq = multiprocessing.Queue(10000)
         oq = multiprocessing.Queue(10000)
+        # New 3-level format: List[List[List[FlowStepQueue]]]
+        # [priority][step][parallel_queue_index]
         queues = [
             [
-                FlowStepQueue(iq, lambda _: True),
-                FlowStepQueue(oq, lambda _: True),
+                [FlowStepQueue(iq, lambda _: True)],  # Step 0 input queue
+                [FlowStepQueue(oq, lambda _: True)],  # Step 1 output queue
             ]
         ]
         worker = Worker(
@@ -63,7 +65,7 @@ def worker():
             batch_timeout=batch_timeout,
             batch_lock=None,
             read_lock=multiprocessing.RLock(),
-            step_number=1)
+            step_number=1)  # Worker reads from step 0 (step_number=1 means it reads from index 0)
         return worker, iq
 
     yield init

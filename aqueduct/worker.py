@@ -2,9 +2,12 @@ import multiprocessing as mp
 import queue
 import signal
 import sys
+import time
 from threading import BrokenBarrierError
 from time import monotonic
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Dict
+
+from aqueduct.parallel_tasks import ParallelTaskCollector
 
 from .handler import BaseTaskHandler
 from .logger import log
@@ -12,7 +15,7 @@ from .metrics.timer import (
     Timer,
     timeit,
 )
-from .queues import FlowStepQueue, select_next_queue
+from .queues import FlowStepQueue, distribute_task_to_next_step
 from .task import BaseTask, DEFAULT_PRIORITY, StopTask
 
 MAX_SPIN_ITERATIONS=1000
@@ -26,29 +29,36 @@ class Worker:
 
     def __init__(
             self,
-            queues: List[List[FlowStepQueue]],
+            queues: List[List[List[FlowStepQueue]]],  
             task_handler: BaseTaskHandler,
             batch_size: int,
             batch_timeout: float,
             batch_lock: Optional[mp.RLock],
             read_lock: mp.RLock,
             step_number: int,
+            parallel_index: Optional[int] = None,  
     ):
         self._queues = queues
         self._queue_priorities = len(self._queues)
         self.task_handler = task_handler
         self.name = task_handler.__class__.__name__
-        self.step_name = self.task_handler.get_step_name(step_number)
+        self.step_name = self.task_handler.get_step_name(
+                                                        step_number,
+                                                        parallel_index + 1 if parallel_index is not None else None,
+                                                        )
         self._batch_size = batch_size
         self._batch_timeout = batch_timeout
         self._batch_lock = batch_lock
-        self._stop_task: BaseTask = None  # noqa
+        self._stop_task: BaseTask = None  
         self._read_lock = read_lock
         self._step_number = step_number
         self._read_queues = [
-            self._queues[priority][self._step_number - 1].queue
+            self._queues[priority][self._step_number - 1][parallel_index or 0].queue  
             for priority in reversed(range(self._queue_priorities))
         ]
+        
+        # Initialize parallel task collector
+        self._tasks_collector = ParallelTaskCollector(step_number, queues)       
 
     def _start(self):
         """Runs something huge (e.g. model) in child process."""
@@ -126,12 +136,14 @@ class Worker:
 
         task.metrics.stop_transfer_timer(self.step_name, task.priority)
 
-        # don't pass an expired task to the next steps
+        # pass an expired task to the next steps if it has collected results
         if task.is_expired():
             log.debug(f'[{self.name}] Task expired. Skip: {task}')
-            return
+            expired_task = self._tasks_collector.get_expired_result(task)
+            return expired_task
 
-        return task
+        # Handle parallel result collection here to centralize the logic
+        return self._tasks_collector.get_result(task)
 
     def _get_batch_with_timeout(self, batch: List[BaseTask]) -> List[BaseTask]:
         """ Collecting incoming tasks into batch.
@@ -227,12 +239,12 @@ class Worker:
 
     def _post_handle(self, task: BaseTask):
         task.metrics.start_transfer_timer(self.step_name)
-        queue_out = select_next_queue(
+        
+        distribute_task_to_next_step(
             queues=self._queues,
             task=task,
-            start_index=self._step_number,
+            current_step=self._step_number - 1  
         )
-        queue_out.put(task)
 
     def _fix_signals(self):
         """ Sometimes some web frameworks (e.g. unicorn) override signal handlers.
@@ -269,4 +281,4 @@ class Worker:
                 self._post_handle(task)
 
         if self._stop_task:
-            self._queues[DEFAULT_PRIORITY][self._step_number].queue.put(self._stop_task)
+            self._queues[DEFAULT_PRIORITY][self._step_number][0].queue.put(self._stop_task)

@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Optional
 from .task import BaseTask
 
 
@@ -11,8 +11,8 @@ class BaseTaskHandler:
        If you need a model that starts for a long time and takes up memory, then use  ModelTaskHandler()."""
 
     @classmethod
-    def get_step_name(cls, step_number: int) -> str:
-        return f'step{step_number}_{cls.__name__}'
+    def get_step_name(cls, step_number: int, parallel_index: Optional[int] = None) -> str:
+        return f'step{step_number}_{cls.__name__}' + f"_pstep{parallel_index}" if parallel_index is not None else f"step{step_number}_{cls.__name__}"
 
     def on_start(self):
         """Called at startup in a child process.
@@ -22,3 +22,11 @@ class BaseTaskHandler:
     def handle(self, *tasks: BaseTask):
         """Called when a task is received from the queue."""
         raise NotImplementedError
+
+
+class ParallelTasksCollectorHandler(BaseTaskHandler):
+    """The base class for your parallel tasks collector.
+       It is used for logic that requires a model and special initialization."""
+
+    def handle(self, *tasks: BaseTask):
+        pass

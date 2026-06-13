@@ -202,8 +202,11 @@ class TestFlow:
         info = simple_flow._get_queues_info()
         queues = simple_flow._queues
         assert len(info) == len(queues[DEFAULT_PRIORITY])
-        assert MAIN_PROCESS in info[queues[DEFAULT_PRIORITY][0].queue]
-        assert MAIN_PROCESS in info[queues[DEFAULT_PRIORITY][-1].queue]
+        # Check that first and last queues have proper names
+        first_queue_name = info[queues[DEFAULT_PRIORITY][0][0].queue]
+        last_queue_name = info[queues[DEFAULT_PRIORITY][-1][0].queue]
+        assert 'from_main_process_to_step1_SleepHandler1' == first_queue_name  # First queue should connect main to first handler
+        assert 'from_step3_SetResultSleepHandler_to_main_process' == last_queue_name  # Last queue should connect last handler to main
 
     async def test_process_expired_task(self, log_file, aqueduct_logger,
                                         slow_sleep_handlers, slow_simple_flow, task):
@@ -223,7 +226,7 @@ class TestFlow:
 
     async def test_enqueue_timeout(self, sleep_handlers, simple_flow, task):
         timeouts = [handler._handler_sec for handler in sleep_handlers]
-        with patch.object(simple_flow._queues[DEFAULT_PRIORITY][0].queue, 'put', MagicMock(side_effect=queue.Full)):
+        with patch.object(simple_flow._queues[DEFAULT_PRIORITY][0][0].queue, 'put', MagicMock(side_effect=queue.Full)):
             with pytest.raises(FlowError, match='timeout'):
                 await simple_flow.process(task, timeout_sec=1)
             await asyncio.sleep(sum(timeouts))
@@ -354,7 +357,7 @@ class TestFlow:
         task = tasks_batch[0]
         await asyncio.sleep(0.1)
         await flow_with_batch_handler.process(task)
-        batch_timeout = flow_with_batch_handler._steps[0].batch_timeout
+        batch_timeout = flow_with_batch_handler._flow_steps[0].batch_timeout
         _, batch_time = flow_with_batch_handler._metrics_manager.collector._metrics.batch_times.items[0]
 
         assert batch_time == pytest.approx(batch_timeout, rel=1e-1)
@@ -373,7 +376,15 @@ class TestFlow:
             _type,
             handlers_not_in_log,
     ):
-        timeouts = [flow_step.handler._handler_sec for flow_step in handle_condition_flow._steps]
+        # Extract timeouts handling both single FlowStep and list[FlowStep] cases
+        timeouts = []
+        for step_or_group in handle_condition_flow._flow_steps:
+            if isinstance(step_or_group, list):
+                # Parallel group - get timeouts from all steps in group
+                timeouts.extend([step.handler._handler_sec for step in step_or_group])
+            else:
+                # Sequential step
+                timeouts.append(step_or_group.handler._handler_sec)
         task._type = _type
 
         await handle_condition_flow.process(task)

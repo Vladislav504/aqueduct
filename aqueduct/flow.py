@@ -8,18 +8,16 @@ import signal
 import sys
 from enum import Enum
 from functools import cached_property
-from functools import reduce
-from itertools import chain
 from multiprocessing import Barrier
 from threading import BrokenBarrierError
 from time import monotonic
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing.resource_tracker import _resource_tracker  # noqa
+from multiprocessing.resource_tracker import _resource_tracker
 
 from .exceptions import FlowError, MPStartMethodValueError, NotRunningError
-from .handler import BaseTaskHandler, HandleConditionType
+from .handler import BaseTaskHandler, HandleConditionType, ParallelTasksCollectorHandler
 from .logger import log
 from .metrics import MAIN_PROCESS, MetricsTypes
 from .metrics.collect import Collector, TasksStats
@@ -80,7 +78,7 @@ class Flow:
 
     def __init__(
             self,
-            *steps: Union[FlowStep, BaseTaskHandler],
+            *steps: Union[FlowStep, List[FlowStep], BaseTaskHandler, List[BaseTaskHandler]],
             metrics_enabled: bool = True,
             metrics_collector: Collector = None,
             metrics_exporter: Exporter = None,
@@ -89,14 +87,14 @@ class Flow:
             mp_start_method: Literal['fork', 'spawn', 'forkserver'] = 'fork',
     ):
         _check_env()
-
-        self._steps: List[FlowStep] = [step if isinstance(step, FlowStep)
-                                       else FlowStep(step) for step in steps]
+        
+        # Initialize common Flow attributes
         self._contexts: Dict[BaseTaskHandler, ProcessContext] = {}
         self._queue_priorities = queue_priorities
-        self._queues: List[List[FlowStepQueue]] = []
         self._task_futures: Dict[str, asyncio.Future] = {}
         self._queue_size: Optional[int] = queue_size
+        self._tasks: List[asyncio.Future] = []
+        self._state: FlowState = FlowState.STOPPED
 
         if mp_start_method != "fork" and mp_start_method != mp.get_start_method():
             log.error(f'MP start method {mp_start_method!r} is set for Flow, it should also be set'
@@ -111,8 +109,29 @@ class Flow:
             metrics_collector = Collector(collectible_metrics=[])
         self._metrics_manager = get_metrics_manager(metrics_collector, metrics_exporter)
 
-        self._state: FlowState = FlowState.STOPPED
-        self._tasks: List[asyncio.Future] = []
+        # Parse steps: list[FlowStep] = parallel, single = sequential
+        self._flow_steps: List[Union[FlowStep, List[FlowStep]]] = []
+        for step in steps:
+            if isinstance(step, list):
+                flow_steps = [s if isinstance(s, FlowStep) else FlowStep(s) for s in step]
+                self._flow_steps.append(flow_steps)
+            elif isinstance(step, FlowStep):
+                self._flow_steps.append(step)
+            else:
+                self._flow_steps.append(FlowStep(step))
+        
+        if not self._flow_steps:
+            raise ValueError("Flow requires at least one step")
+
+        # Simplified queue structure: List[List[List[FlowStepQueue]]]
+        # Each step always has a list of queues (even if just one queue)
+        self._queues: List[List[List[FlowStepQueue]]] = []
+
+        # Add parallel tasks collector handler if last step is a list (parallel steps)
+        if isinstance(self._flow_steps[-1], list):
+            self._flow_steps.append(FlowStep(
+                ParallelTasksCollectorHandler(),
+            ))
 
     @property
     def state(self):
@@ -121,6 +140,10 @@ class Flow:
     @property
     def is_running(self) -> bool:
         return self._state == FlowState.RUNNING
+
+    @cached_property
+    def need_collect_task_timers(self) -> bool:
+        return self._metrics_manager.collector.is_collectible(MetricsTypes.TASK_TIMERS)
 
     def start(self, timeout: Optional[int] = None):
         """
@@ -140,7 +163,6 @@ class Flow:
         Starts processing task through pipeline and returns True if all was ok.
         The result is saved in the source task
         """
-
         if not self.is_running:
             raise NotRunningError
 
@@ -153,17 +175,45 @@ class Flow:
             task.metrics.start_transfer_timer(MAIN_PROCESS)
 
             start_time = monotonic()
-            to_queue = select_next_queue(
-                queues=self._queues,
-                task=task,
-            )
-            while self.state != FlowState.STOPPED and (monotonic() - start_time) < timeout_sec:
-                try:
-                    to_queue.put(task, block=False)
-                except queue.Full:
-                    await asyncio.sleep(0.001)
-                else:
-                    break
+            
+            # Handle task distribution - check if we have parallel flow structure
+            if any(isinstance(step, list) for step in self._flow_steps):
+                # New parallel flow structure
+                async def distribute_task(task: BaseTask, timeout_sec: float, start_time: float):
+                    """Task distribution using centralized queue logic with async retry for full queues."""
+                    from .queues import find_target_queues
+                    
+                    # Find target queues starting from step 0 (first step)
+                    target_queues = find_target_queues(
+                        queues=self._queues,
+                        task=task,
+                        current_step=0
+                    )
+                    
+                    # Send task to all target queues with retry logic for full queues
+                    for to_queue in target_queues:
+                        while self.state != FlowState.STOPPED and (monotonic() - start_time) < timeout_sec:
+                            try:
+                                to_queue.put(task, block=False)
+                            except queue.Full:
+                                await asyncio.sleep(0.001)
+                            else:
+                                break
+                
+                await distribute_task(task, timeout_sec, start_time)
+            else:
+                # Original sequential flow structure
+                to_queue = select_next_queue(
+                    queues=self._queues,
+                    task=task,
+                )
+                while self.state != FlowState.STOPPED and (monotonic() - start_time) < timeout_sec:
+                    try:
+                        to_queue.put(task, block=False)
+                    except queue.Full:
+                        await asyncio.sleep(0.001)
+                    else:
+                        break
 
             elapsed_time = monotonic() - start_time
 
@@ -209,7 +259,8 @@ class Flow:
         log.info('Flow is stopping')
 
         if graceful:
-            self._queues[DEFAULT_PRIORITY][0].queue.put(StopTask())
+            first_queue = self._queues[DEFAULT_PRIORITY][0][0].queue  # Always [step][queue_index]
+            first_queue.put(StopTask())
             await asyncio.sleep(3)
 
         self._metrics_manager.stop()
@@ -223,11 +274,7 @@ class Flow:
         self._state = FlowState.STOPPED
         log.info('Flow was stopped')
 
-    @cached_property
-    def need_collect_task_timers(self) -> bool:
-        return self._metrics_manager.collector.is_collectible(MetricsTypes.TASK_TIMERS)
-
-    def _calc_queue_size(self, step: FlowStep):
+    def _calc_queue_size(self, step: Union[FlowStep, List[FlowStep]]):
         """ If queue size not specified manually, get queue size based on batch size for handler.
         We need at least batch_size places in queue and then some additional space
         """
@@ -235,18 +282,33 @@ class Flow:
             return self._queue_size
 
         # queue should be able to store at least 20 task, that's seems reasonable
-        return max(step.batch_size*3, 20)
-    
+
+        if isinstance(step, list):
+            return max(sum(s.batch_size*3 for s in step), 20)
+        else:
+            return max(step.batch_size*3, 20)
+
     async def _check_memory_usage(self, sleep_sec: float = 1.):
         handler_processes_dict = {}
-        for step_number, handler in enumerate(self._contexts):
-            flow_step_name = handler.get_step_name(step_number)
-            pids = self._contexts[handler].pids()
-            processes = []
-            for pid in pids:
-                process = psutil.Process(pid)
-                processes.append(process)
-            handler_processes_dict[flow_step_name] = processes
+
+        for step_number, step in enumerate(self._flow_steps, 1):
+            if isinstance(step, list):
+                for parallel_index, step_ in enumerate(step, 1):
+                    name = step_.handler.get_step_name(step_number, parallel_index)
+                    pids = self._contexts[step_.handler].pids()
+                    processes = []
+                    for pid in pids:
+                        process = psutil.Process(pid)
+                        processes.append(process)
+                    handler_processes_dict[name] = processes
+            else:
+                name = step.handler.get_step_name(step_number, None)
+                pids = self._contexts[step.handler].pids()
+                processes = []
+                for pid in pids:
+                    process = psutil.Process(pid)
+                    processes.append(process)
+                handler_processes_dict[name] = processes
 
         while self.state != FlowState.STOPPED:
             metrics = MetricsItems()
@@ -265,60 +327,109 @@ class Flow:
             await asyncio.sleep(sleep_sec)
 
     def _run_steps(self, timeout: Optional[int]):
-        if len(self._steps) == 0:
+        if len(self._flow_steps) == 0:
             log.info('Flow has zero steps -> do nothing')
             return
 
-        # count how many processes we will create, to setup a barrier
-        total_procs = reduce(lambda a, b: a + b.nprocs, self._steps, 0)
-        # also count main process
-        total_procs += 1
+        # Count total processes
+        total_procs = 1  # main process
+        for step_or_group in self._flow_steps:
+            if isinstance(step_or_group, list):
+                total_procs += sum(s.nprocs for s in step_or_group)
+            else:
+                total_procs += step_or_group.nprocs
+        
         start_barrier = Barrier(total_procs)
 
+        # Create uniform queue structure - every step has a list of queues
         for _ in range(self._queue_priorities):
-            queues: List[FlowStepQueue] = []
-            for step in self._steps:
-                queue_size = self._calc_queue_size(step)
-                queues.append(
-                    FlowStepQueue(
+            queues = []
+            
+            for step_or_group in self._flow_steps:
+                if isinstance(step_or_group, list):
+                    # Parallel steps: create list with multiple input queues
+                    parallel_queues = []
+                    for step in step_or_group:
+                        queue_size = self._calc_queue_size(step)
+                        parallel_queues.append(FlowStepQueue(
+                            queue=TaskMetricsQueue(queue_size),
+                            handle_condition=step.handle_condition,
+                        ))
+                    queues.append(parallel_queues)  # List with multiple queues
+                else:
+                    # Sequential step: create list with single queue
+                    step = step_or_group
+                    queue_size = self._calc_queue_size(step)
+                    queues.append([FlowStepQueue(  # List with single queue
                         queue=TaskMetricsQueue(queue_size),
                         handle_condition=step.handle_condition,
-                    )
-                )
-
-            # Add out queue
-            queue_size = self._calc_queue_size(self._steps[-1])
-            queues.append(
-                FlowStepQueue(
-                    queue=TaskMetricsQueue(queue_size),
-                    handle_condition=operator.truth,
-                )
+                    )])
+            
+            # Final output queue - also a list with single queue
+            final_step = self._flow_steps[-1]
+            queue_size = self._calc_queue_size(
+                final_step
             )
+            queues.append([FlowStepQueue(  # List with single queue
+                queue=TaskMetricsQueue(queue_size),
+                handle_condition=operator.truth,
+            )])
+            
             self._queues.append(queues)
 
-        for step_number, step in enumerate(self._steps, 1):
-            worker_curr = Worker(
-                queues=self._queues,
-                task_handler=step.handler,
-                batch_size=step.batch_size,
-                batch_timeout=step.batch_timeout,
-                batch_lock=mp.RLock() if step.nprocs > 1 and step.batch_size > 1 else None,
-                read_lock=mp.RLock(),
-                step_number=step_number,
-            )
-            self._contexts[step.handler] = start_processes(
-                worker_curr.loop,
-                nprocs=step.nprocs, join=False, daemon=True, start_method=self._mp_start_method,
-                args=(start_barrier,),
-                on_start_wait=step.on_start_wait,
-            )
-            log.info(f'Created step {step.handler}, '
-                     f'queue_in: {self._queues[DEFAULT_PRIORITY][step_number - 1].queue}, '
-                     f'queue_out: {self._queues[DEFAULT_PRIORITY][step_number].queue}')
+        step_number = 1
+        
+        for step_or_group in self._flow_steps:
+            if isinstance(step_or_group, list):
+                # Create parallel workers
+                for i, step in enumerate(step_or_group):
+                    worker = Worker(
+                        queues=self._queues,
+                        task_handler=step.handler,
+                        batch_size=step.batch_size,
+                        batch_timeout=step.batch_timeout,
+                        batch_lock=mp.RLock() if step.nprocs > 1 and step.batch_size > 1 else None,
+                        read_lock=mp.RLock(),
+                        step_number=step_number,
+                        parallel_index=i,  # Each parallel worker gets its own queue index
+                    )
+                    
+                    self._contexts[step.handler] = start_processes(
+                        worker.loop, nprocs=step.nprocs, join=False, daemon=True,
+                        start_method=self._mp_start_method, args=(start_barrier,),
+                        on_start_wait=step.on_start_wait,
+                    )
+                    
+                    log.info(f'Created parallel step {step.handler.__class__.__name__}')
+                
+                step_number += 1
+                
+            else:
+                # Sequential step
+                worker = Worker(
+                    queues=self._queues,
+                    task_handler=step_or_group.handler,
+                    batch_size=step_or_group.batch_size,
+                    batch_timeout=step_or_group.batch_timeout,
+                    batch_lock=mp.RLock() if step_or_group.nprocs > 1 and step_or_group.batch_size > 1 else None,
+                    read_lock=mp.RLock(),
+                    step_number=step_number,
+                    parallel_index=None,  # Sequential step
+                )
+                
+                self._contexts[step_or_group.handler] = start_processes(
+                    worker.loop, nprocs=step_or_group.nprocs, join=False, daemon=True,
+                    start_method=self._mp_start_method, args=(start_barrier,),
+                    on_start_wait=step_or_group.on_start_wait,
+                )
+                
+                log.info(f'Created sequential step {step_or_group.handler.__class__.__name__}')
+                step_number += 1
 
-        # fix to avoid deadlock on program exit
-        for step_queue in chain.from_iterable(self._queues):
-            step_queue.queue.cancel_join_thread()
+        for queue_list in self._queues:
+            for step_queues in queue_list:
+                for step_queue in step_queues:
+                    step_queue.queue.cancel_join_thread()
 
         try:
             log.info(f'Waiting for all workers to startup for {timeout} seconds...')
@@ -327,6 +438,7 @@ class Flow:
             raise TimeoutError('Starting timeout expired')
 
     def _run_tasks(self):
+        """Start common background tasks"""
         self._tasks.append(asyncio.ensure_future(self._fetch_processed()))
         self._tasks.append(asyncio.ensure_future(self._check_is_alive()))
 
@@ -334,26 +446,32 @@ class Flow:
         self._tasks.append(asyncio.ensure_future(self._check_memory_usage()))
 
     def _get_queues_info(self) -> Dict[mp.Queue, str]:
-        """Returns queues between Step handlers and its names.
+        """Returns queues between Step handlers and its names."""
 
-        The queue name consists of two handler names that are connected by this queue.
-        """
+        def step_queues_info() -> List[Tuple[int, Tuple[str, str, FlowStepQueue]]]:
+            for priority in range(self._queue_priorities):
+                from_step = MAIN_PROCESS
 
-        def step_names(handlers):
-            from_step = MAIN_PROCESS
-            for step_number, handler in enumerate(handlers, 1):
-                to_step = handler.get_step_name(step_number)
-                yield from_step, to_step
-                from_step = to_step
-            yield from_step, MAIN_PROCESS
+                for (step_number, step), queues in zip(enumerate(self._flow_steps, 1), self._queues[priority]):
+                    if isinstance(step, list):
+                        for (parallel_index, step_), queue_ in zip(enumerate(step, 1), queues):
+                            handler = step_.handler
+                            to_step = handler.get_step_name(step_number, parallel_index)
+                            yield (priority, (from_step, to_step, queue_))
+                        from_step = f"pstep{step_number}"
+                    else:
+                        queue_ = queues[0]
+                        to_step = step.handler.get_step_name(step_number, None)
+                        yield (priority, (from_step, to_step, queue_))
+                        from_step = to_step
+
+                to_step = MAIN_PROCESS
+                yield (priority, (from_step, to_step, self._queues[priority][-1][0]))
+
         result = {}
-        for priority in range(self._queue_priorities):
-            result.update(
-                {
-                    queue_.queue: f'p_{priority}_from_{from_}_to_{to}' if priority > 0 else f'from_{from_}_to_{to}'
-                    for queue_, (from_, to) in zip(self._queues[priority], step_names(self._contexts))
-                }
-            )
+        for priority, (from_step_name, to_step_name, queue_) in step_queues_info():
+            name = f'p_{priority}_from_{from_step_name}_to_{to_step_name}' if priority > 0 else f'from_{from_step_name}_to_{to_step_name}'
+            result[queue_.queue] = name
         return result
 
     @staticmethod
@@ -390,7 +508,7 @@ class Flow:
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=self._queue_priorities) as queue_fetch_executor:
             results_queues = [
-                queues_with_same_priority[-1].queue for queues_with_same_priority in self._queues
+                queues_with_same_priority[-1][0].queue for queues_with_same_priority in self._queues
             ]
             tasks = [
                 loop.run_in_executor(queue_fetch_executor, self._read_from_queue, loop, q)
