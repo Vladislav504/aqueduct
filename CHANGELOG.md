@@ -1,6 +1,16 @@
-# 1.12.0
+# 1.14.0
 - Add parallel flow for processing one task in multiple steps concurrently
 - Add event loop to handlers child process for asyncio
+
+# 1.13.1
+- Fix subprocess join timeout to allow pytest-cov to collect coverage data from child processes
+
+# 1.13.0
+- Add socket transport to support concurrent web workers compatibility with 1 Flow instance
+
+# 1.12.0
+- Precompile atomic module during setup; GCC, `cffi` and `setuptools` are no longer needed at runtime
+- Relax `cffi` and `setuptools` version constraints
 
 # 1.11.7
 - Update `cffi` version to allow python3.12 support, add `setuptools` to requirements

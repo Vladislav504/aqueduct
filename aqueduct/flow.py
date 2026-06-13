@@ -72,6 +72,7 @@ class FlowState(Enum):
     STARTING = 'starting'
     STOPPING = 'stopping'
     STOPPED = 'stopped'
+    STEPS_INITIALIZED = 'steps_initialized'
 
 
 class Flow:
@@ -145,6 +146,10 @@ class Flow:
     def need_collect_task_timers(self) -> bool:
         return self._metrics_manager.collector.is_collectible(MetricsTypes.TASK_TIMERS)
 
+    @property
+    def are_steps_initialized(self) -> bool:
+        return self._state == FlowState.STEPS_INITIALIZED
+
     def start(self, timeout: Optional[int] = None):
         """
         Starts Flow and waits for all subprocesses to initialize.
@@ -154,6 +159,21 @@ class Flow:
         log.info('Flow is starting')
         self._state = FlowState.STARTING
         self._run_steps(timeout)
+        self._run_tasks()
+        self._state = FlowState.RUNNING
+        log.info('Flow was started')
+
+    def init_processes(self, timeout: Optional[int] = None):
+        """initialize Flow subprocesses."""
+        log.info('Flow inits step processes')
+        self._run_steps(timeout)
+        self._state = FlowState.STEPS_INITIALIZED
+        log.info('Flow processes are inited')
+
+    def start_inited(self):
+        """Starts Flow instance in main-flow process."""
+        log.info('Flow is starting')
+        self._state = FlowState.STARTING
         self._run_tasks()
         self._state = FlowState.RUNNING
         log.info('Flow was started')
@@ -547,15 +567,16 @@ class Flow:
             await asyncio.sleep(sleep_sec)
 
     @staticmethod
-    def _join_context(context: ProcessContext, timeout_sec: float = 0.01):
-        try:
-            context.join(timeout_sec)
-        except (ProcessExitedException, ProcessRaisedException):
-            pass
-
-        for p in context.processes:
-            if p.is_alive():
-                os.kill(p.pid, signal.SIGKILL)
+    def _join_context(context: ProcessContext, timeout_sec: float = 5.0):
+        # First, try to join processes gracefully using join_all().
+        # This gives subprocesses time to flush coverage data (needed for
+        # pytest-cov subprocess support) and perform other cleanup.
+        # See: https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
+        if not context.join_all(timeout=timeout_sec):
+            # Some processes didn't exit in time — escalate to SIGKILL.
+            for p in context.processes:
+                if p.is_alive():
+                    os.kill(p.pid, signal.SIGKILL)
 
     @property
     def _processes_context(self) -> ProcessContext:
