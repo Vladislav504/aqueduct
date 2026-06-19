@@ -29,14 +29,16 @@ class Worker:
 
     def __init__(
             self,
-            queues: List[List[List[FlowStepQueue]]],  
+            queues: List[List[List[FlowStepQueue]]],
             task_handler: BaseTaskHandler,
             batch_size: int,
             batch_timeout: float,
             batch_lock: Optional[mp.RLock],
             read_lock: mp.RLock,
             step_number: int,
-            parallel_index: Optional[int] = None,  
+            parallel_index: Optional[int] = None,
+            zero_copy_fanout: bool = False,
+            min_share_bytes: Optional[int] = None,
     ):
         self._queues = queues
         self._queue_priorities = len(self._queues)
@@ -49,9 +51,12 @@ class Worker:
         self._batch_size = batch_size
         self._batch_timeout = batch_timeout
         self._batch_lock = batch_lock
-        self._stop_task: BaseTask = None  
+        self._stop_task: BaseTask = None
         self._read_lock = read_lock
         self._step_number = step_number
+        self._parallel_index = parallel_index
+        self._zero_copy_fanout = zero_copy_fanout
+        self._min_share_bytes = min_share_bytes
         self._read_queues = [
             self._queues[priority][self._step_number - 1][parallel_index or 0].queue  
             for priority in reversed(range(self._queue_priorities))
@@ -239,11 +244,16 @@ class Worker:
 
     def _post_handle(self, task: BaseTask):
         task.metrics.start_transfer_timer(self.step_name)
-        
+
+        if self._parallel_index is not None:
+            task._fanout_branch_index = self._parallel_index
+
         distribute_task_to_next_step(
             queues=self._queues,
             task=task,
-            current_step=self._step_number - 1  
+            current_step=self._step_number - 1,
+            zero_copy_fanout=self._zero_copy_fanout,
+            min_share_bytes=self._min_share_bytes,
         )
 
     def _fix_signals(self):
@@ -281,4 +291,5 @@ class Worker:
                 self._post_handle(task)
 
         if self._stop_task:
-            self._queues[DEFAULT_PRIORITY][self._step_number][0].queue.put(self._stop_task)
+            for step_queue in self._queues[DEFAULT_PRIORITY][self._step_number]:
+                step_queue.queue.put(self._stop_task)

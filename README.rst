@@ -20,6 +20,7 @@ Documentation
 - - `Fundamentals <docs/fundamentals.rst>`_
 - - `Example <docs/example.rst>`_
 - `Batching <docs/batching.rst>`_
+- `Parallel Flow <docs/parallel_flow.rst>`_
 - `Logging <docs/logging.rst>`_
 - `Metrics <docs/metrics.rst>`_
 - `F.A.Q. <docs/faq.rst>`_

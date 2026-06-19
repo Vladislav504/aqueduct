@@ -32,7 +32,7 @@ from .multiprocessing import (
     ProcessRaisedException,
     start_processes,
 )
-from .queues import FlowStepQueue, select_next_queue
+from .queues import FlowStepQueue, distribute_task_async
 from .task import BaseTask, DEFAULT_PRIORITY, StopTask
 from .worker import Worker
 from .metrics.base import MetricsItems
@@ -86,6 +86,9 @@ class Flow:
             queue_size: Optional[int] = None,
             queue_priorities: int = 1,
             mp_start_method: Literal['fork', 'spawn', 'forkserver'] = 'fork',
+            zero_copy_fanout: bool = False,
+            fanout_min_share_bytes: Optional[int] = None,
+            result_fetch_threads: Optional[int] = None,
     ):
         _check_env()
         
@@ -96,6 +99,16 @@ class Flow:
         self._queue_size: Optional[int] = queue_size
         self._tasks: List[asyncio.Future] = []
         self._state: FlowState = FlowState.STOPPED
+        # Zero-copy fan-out (opt-in): share large payload fields once instead of
+        # copying them to every parallel branch. Branches must treat shared
+        # payload fields as read-only. Falls back to copy when sharing is impossible.
+        self._zero_copy_fanout = zero_copy_fanout
+        self._fanout_min_share_bytes = fanout_min_share_bytes
+        # Number of threads draining final result queues on the main process.
+        # Defaults to one per priority (previous behaviour) but can be raised to
+        # parallelise unpickling of large final results (relieves the main-process
+        # collection bottleneck).
+        self._result_fetch_threads = result_fetch_threads
 
         if mp_start_method != "fork" and mp_start_method != mp.get_start_method():
             log.error(f'MP start method {mp_start_method!r} is set for Flow, it should also be set'
@@ -133,6 +146,32 @@ class Flow:
             self._flow_steps.append(FlowStep(
                 ParallelTasksCollectorHandler(),
             ))
+
+        self._validate_steps()
+
+    def _validate_steps(self):
+        """Validate step configuration.
+
+        Any sequential step that immediately follows a parallel group acts as the
+        collector for that group. The collector keeps partial parallel results in
+        per-process memory keyed by ``task_id``; running it with ``nprocs > 1``
+        would scatter a single task's branch results across processes and the
+        collection would never complete (the task would hang until timeout).
+        We therefore force such collector steps to ``nprocs == 1``.
+        """
+        for idx, step in enumerate(self._flow_steps):
+            if idx == 0:
+                continue
+            prev = self._flow_steps[idx - 1]
+            is_collector = isinstance(prev, list) and not isinstance(step, list)
+            if is_collector and isinstance(step, FlowStep) and step.nprocs > 1:
+                log.warning(
+                    'Step %s collects results from a parallel group and must run in a '
+                    'single process; forcing nprocs from %d to 1 to keep parallel '
+                    'result assembly correct.',
+                    step.handler.__class__.__name__, step.nprocs,
+                )
+                step.nprocs = 1
 
     @property
     def state(self):
@@ -195,45 +234,18 @@ class Flow:
             task.metrics.start_transfer_timer(MAIN_PROCESS)
 
             start_time = monotonic()
-            
-            # Handle task distribution - check if we have parallel flow structure
-            if any(isinstance(step, list) for step in self._flow_steps):
-                # New parallel flow structure
-                async def distribute_task(task: BaseTask, timeout_sec: float, start_time: float):
-                    """Task distribution using centralized queue logic with async retry for full queues."""
-                    from .queues import find_target_queues
-                    
-                    # Find target queues starting from step 0 (first step)
-                    target_queues = find_target_queues(
-                        queues=self._queues,
-                        task=task,
-                        current_step=0
-                    )
-                    
-                    # Send task to all target queues with retry logic for full queues
-                    for to_queue in target_queues:
-                        while self.state != FlowState.STOPPED and (monotonic() - start_time) < timeout_sec:
-                            try:
-                                to_queue.put(task, block=False)
-                            except queue.Full:
-                                await asyncio.sleep(0.001)
-                            else:
-                                break
-                
-                await distribute_task(task, timeout_sec, start_time)
-            else:
-                # Original sequential flow structure
-                to_queue = select_next_queue(
-                    queues=self._queues,
-                    task=task,
-                )
-                while self.state != FlowState.STOPPED and (monotonic() - start_time) < timeout_sec:
-                    try:
-                        to_queue.put(task, block=False)
-                    except queue.Full:
-                        await asyncio.sleep(0.001)
-                    else:
-                        break
+
+            await distribute_task_async(
+                queues=self._queues,
+                task=task,
+                current_step=0,
+                should_continue=lambda: (
+                    self.state != FlowState.STOPPED
+                    and (monotonic() - start_time) < timeout_sec
+                ),
+                zero_copy_fanout=self._zero_copy_fanout,
+                min_share_bytes=self._fanout_min_share_bytes,
+            )
 
             elapsed_time = monotonic() - start_time
 
@@ -278,16 +290,26 @@ class Flow:
         self._state = FlowState.STOPPING
         log.info('Flow is stopping')
 
+        stop_task = StopTask()
         if graceful:
-            first_queue = self._queues[DEFAULT_PRIORITY][0][0].queue  # Always [step][queue_index]
-            first_queue.put(StopTask())
             await asyncio.sleep(3)
+            for step_queue in self._queues[DEFAULT_PRIORITY][0]:
+                step_queue.queue.put(stop_task)
+            pending_futures = [
+                f for f in self._task_futures.values() if not f.done()
+            ]
+            if pending_futures:
+                await asyncio.wait(pending_futures, timeout=2.0)
+        else:
+            for step_queue in self._queues[DEFAULT_PRIORITY][0]:
+                step_queue.queue.put(stop_task)
 
         self._metrics_manager.stop()
         for task in self._tasks:
             task.cancel()
-        for task in self._task_futures.values():
-            task.cancel()
+        if not graceful:
+            for task in self._task_futures.values():
+                task.cancel()
 
         self._join_context(self._processes_context)
 
@@ -412,6 +434,8 @@ class Flow:
                         read_lock=mp.RLock(),
                         step_number=step_number,
                         parallel_index=i,  # Each parallel worker gets its own queue index
+                        zero_copy_fanout=self._zero_copy_fanout,
+                        min_share_bytes=self._fanout_min_share_bytes,
                     )
                     
                     self._contexts[step.handler] = start_processes(
@@ -435,6 +459,8 @@ class Flow:
                     read_lock=mp.RLock(),
                     step_number=step_number,
                     parallel_index=None,  # Sequential step
+                    zero_copy_fanout=self._zero_copy_fanout,
+                    min_share_bytes=self._fanout_min_share_bytes,
                 )
                 
                 self._contexts[step_or_group.handler] = start_processes(
@@ -495,45 +521,76 @@ class Flow:
         return result
 
     @staticmethod
-    def _fetch_from_queue(out_queue: mp.Queue) -> Union[BaseTask, None]:
+    def _fetch_from_queue(out_queue: mp.Queue, timeout: float = 1.) -> Union[BaseTask, None]:
         try:
-            task = out_queue.get(timeout=1.)
+            task = out_queue.get(timeout=timeout)
             return task
         except queue.Empty:
             return None
 
+    def _deliver_result(self, loop: asyncio.AbstractEventLoop, q: mp.Queue, task: BaseTask) -> None:
+        """Resolve the awaiting future for a finished task."""
+        fut = self._task_futures.get(task.task_id)
+        if fut and not fut.cancelled() and not fut.done():
+            task.metrics.stop_transfer_timer(MAIN_PROCESS, task.priority)
+            task_size = getattr(q, 'task_size', None)
+            if task_size:
+                task.metrics.save_task_size(task_size, MAIN_PROCESS, task.priority)
+
+            loop.call_soon_threadsafe(fut.set_result, task)
+
     def _read_from_queue(self, loop: asyncio.AbstractEventLoop, q: mp.Queue) -> None:
+        """Drain finished tasks from a single result queue.
+
+        Improvement over the previous one-get-per-loop implementation: after the
+        first blocking ``get`` we greedily drain everything already available in
+        the queue (non-blocking) before going back to sleep. This batches the
+        expensive unpickle/dispatch work and reduces the per-object overhead that
+        previously made the main-process collection a throughput bottleneck.
+
+        Multiple threads may share the same queue (see ``result_fetch_threads``);
+        ``mp.Queue`` is process/thread-safe for ``get`` so they simply compete for
+        items, parallelising deserialization of large final results.
+        """
         while self.state != FlowState.STOPPED:
-            task = self._fetch_from_queue(q)
+            task = self._fetch_from_queue(q, timeout=1.)
 
             if task is None:
                 continue
 
-            fut = self._task_futures.get(task.task_id)
-            if fut and not fut.cancelled() and not fut.done():
-                task.metrics.stop_transfer_timer(MAIN_PROCESS, task.priority)
-                task_size = getattr(q, 'task_size', None)
-                if task_size:
-                    task.metrics.save_task_size(task_size, MAIN_PROCESS, task.priority)
+            self._deliver_result(loop, q, task)
 
-                loop.call_soon_threadsafe(fut.set_result, task)
+            # Greedily drain whatever else is immediately available.
+            while self.state != FlowState.STOPPED:
+                task = self._fetch_from_queue(q, timeout=0.)
+                if task is None:
+                    break
+                self._deliver_result(loop, q, task)
 
     async def _fetch_processed(self):
-        """Fetching messages from output queue.
+        """Fetching messages from output queues.
 
-        To handle messages from another process and not block asyncio loop, we run queue.get()
-        in a separate thread
-
+        To handle messages from another process and not block the asyncio loop, we
+        run blocking ``queue.get()`` calls in worker threads. By default we use one
+        thread per priority (previous behaviour); ``result_fetch_threads`` can raise
+        this so several threads drain the (large) final results concurrently,
+        relieving the single-threaded collection bottleneck on the main process.
         """
         loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=self._queue_priorities) as queue_fetch_executor:
-            results_queues = [
-                queues_with_same_priority[-1][0].queue for queues_with_same_priority in self._queues
-            ]
-            tasks = [
-                loop.run_in_executor(queue_fetch_executor, self._read_from_queue, loop, q)
-                for q in results_queues
-            ]
+        results_queues = [
+            queues_with_same_priority[-1][0].queue for queues_with_same_priority in self._queues
+        ]
+
+        threads_per_queue = max(1, self._result_fetch_threads or 1)
+        max_workers = max(self._queue_priorities, len(results_queues) * threads_per_queue)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as queue_fetch_executor:
+            tasks = []
+            for q in results_queues:
+                for _ in range(threads_per_queue):
+                    tasks.append(
+                        loop.run_in_executor(queue_fetch_executor, self._read_from_queue, loop, q)
+                    )
             done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
             for t in done:
                 try:

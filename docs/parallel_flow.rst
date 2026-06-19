@@ -1,76 +1,211 @@
-Суммаризация встречи
-Основная тема:
-Обсуждение реализации параллельных шагов в aqueductflow и оптимизация архитектуры.
+Parallel Flow
+#############
 
-Что было сделано:
+Aqueduct lets a single step fan a task out to several handlers that run **in parallel**
+(each in its own os process) and then collects their results back into the original task.
+This is useful when a task needs several *independent* CPU-bound computations
+(for example: several models scoring the same image), since the branches run
+concurrently instead of one after another.
 
-Реализовал прототип ParallelFlow с "ассемблером" (сборщиком результатов).
 
-Поддержка вложенных flow cредством стандартных хендлеров и asyncio.
+Defining a parallel step
+************************
+A parallel step is just a **list** of handlers (or ``FlowStep`` objects) passed to ``Flow``.
+A single handler (not in a list) is a regular sequential step, exactly as before.
 
-Сделал тестовую интеграцию в один сервис:
+.. code-block:: python
 
-При лёгких моделях (20ms) решение стало работать медленнее (из-за overhead на передачи задач между шагами).
+    from aqueduct import Flow, FlowStep, BaseTaskHandler, BaseTask
 
-Потенциальная польза видна для тяжёлых CPU-задач, где параллельность даст выигрыш.
 
-Основные замечания и предложения:
+    class Task(BaseTask):
+        def __init__(self):
+            super().__init__()
+            self.score_a = None
+            self.score_b = None
 
-Ассемблер как отдельный процесс — избыточен.
 
-Сборку результатов можно делать прямо в шаге-обработчике (handler), используя mapping для хранения частичных результатов.
+    class ModelA(BaseTaskHandler):
+        def handle(self, *tasks: Task):
+            for task in tasks:
+                task.score_a = 1
 
-Нужно предусмотреть таймаут/протухание, если какой-то параллельный шаг "падает" и не отдаёт результат.
 
-Flow внутри Flow — не обязательно для текущей задачи.
+    class ModelB(BaseTaskHandler):
+        def handle(self, *tasks: Task):
+            for task in tasks:
+                task.score_b = 2
 
-Идея перспективная (подходит для кейсов типа OCR, где несколько независимых flow), но для параллельных шагов достаточно писать одну и ту же задачу сразу в несколько очередей.
 
-У каждого процесса всегда одна входная очередь, а вот выходных может быть несколько.
+    # ModelA and ModelB process the same task in parallel.
+    flow = Flow([ModelA(), ModelB()])
+    flow.start()
 
-Пример:
+    task = Task()
+    await flow.process(task)
+    assert task.score_a == 1
+    assert task.score_b == 2
 
-Vectorizer → пишет в 4 очереди (по одной на каждую модель).
+    await flow.stop()
 
-Каждая модель → пишет в одну общую очередь, которую читает следующий шаг.
+You can mix sequential and parallel steps freely. A sequential step that immediately
+follows a parallel step acts as the **collector** for that group:
 
-Пользовательский код должен быть простым.
+.. code-block:: python
 
-Не нужно вводить новые сущности (ParallelFlowStep).
+    flow = Flow(
+        PreprocessHandler(),       # sequential step
+        [ModelA(), ModelB()],      # parallel step (fan-out)
+        AggregateHandler(),        # sequential step that sees the merged task
+    )
 
-Достаточно поддержать возможность указывать список шагов → это автоматически трактуется как параллельное выполнение.
+If the parallel group is the last step, Aqueduct automatically appends an internal
+collector, so you do not have to add one yourself.
 
-Для пользователя изменение минимально: вместо одного шага он указывает список.
 
-Оптимизация на будущее (не сейчас):
+How a task flows through a parallel step
+****************************************
+1. The task is sent (fanned out) to every branch whose ``handle_condition`` matches.
+2. Each branch processes its **own copy** of the task in a separate process.
+3. The branch results are collected and merged back into a single task.
+4. The merged task continues to the next step (or is returned to ``process``).
 
-Рассмотреть возможность одной сериализации задачи перед записью в N очередей (чтобы не было N-кратной сериализации).
 
-Вынести кастомный ассемблер только если появятся реальные кейсы.
+Result collection and merge semantics
+*************************************
+Each branch receives an independent copy of the task and writes its own fields.
+When all expected branches have returned, their copies are merged into one task.
 
-Поставленные задачи
-Изменить архитектуру:
+- Branches are merged in **ascending branch order** (the order in which the handlers
+  appear in the list).
+- If two branches write the **same** field, the value from the **later** branch
+  (higher index in the list) wins. Have branches write to distinct fields to avoid
+  relying on this.
+- Shared-memory fields (see `Shared memory <share_memory.rst>`_) are merged safely:
+  a field that is already shared is not overwritten.
 
-Убрать отдельный Assembler процесс.
+.. code-block:: python
 
-Реализовать сборку результатов внутри handler в  map и таймаутами.
+    flow = Flow([ModelA(), ModelB()])  # ModelB wins on any field both write
 
-Упростить API для пользователя:
 
-Сделать поддержку list[FlowStep] как параллельного шага.
+Conditional branches
+====================
+Use ``handle_condition`` to send a task only to some branches. A task is counted as
+"expected" by exactly the branches whose condition matched at fan-out time, so the
+collector knows how many results to wait for.
 
-Задокументировать поведение при конфликтах (если несколько шагов пишут в одно и то же поле таски — перезаписывается).
+.. code-block:: python
 
-Очереди:
+    flow = Flow([
+        FlowStep(TypeAHandler(), handle_condition=lambda t: t.kind == 'a'),
+        FlowStep(TypeBHandler(), handle_condition=lambda t: t.kind == 'b'),
+    ])
 
-Каждому процессу — одна входная очередь.
+A task that matches no branch condition is passed through to the next step unchanged.
 
-У шагов может быть несколько выходных.
+.. note::
+   The number of branches a task fans out to is fixed at the moment of fan-out.
+   A branch handler may safely mutate the fields that other branches' conditions
+   read — it will not change how many results the collector waits for.
 
-Vectorizer пишет одну и ту же задачу в 4 очереди → каждая модель получает копию.
 
-Оптимизация (отложено):
+Timeouts and expiration
+=======================
+``process`` accepts ``timeout_sec`` (5 seconds by default). If a branch fails or is
+too slow and not all results arrive in time, the task expires: whatever partial
+results were collected are assembled and the awaiting ``process`` call raises
+``FlowError``. Abandoned partial collections are evicted automatically, so a failing
+branch does not leak memory.
 
-Сериализация 1→N.
 
-Кастомные сборщики результатов.
+Constraints
+===========
+The collector keeps partial results in memory, keyed by task id, in a single process.
+For this reason a step that collects a parallel group is always run with ``nprocs == 1``;
+if you configure a higher value it is forced back to ``1`` (with a warning) to keep
+result assembly correct.
+
+In the example below ``AggregateHandler`` directly follows the parallel group, so it is
+the collector. Even though it is configured with ``nprocs=4``, Aqueduct forces it to
+``1`` and logs a warning:
+
+.. code-block:: python
+
+    collector_step = FlowStep(AggregateHandler(), nprocs=4)
+    flow = Flow(
+        [ModelA(), ModelB()],   # parallel group
+        collector_step,         # collector -> forced to nprocs == 1
+    )
+
+    assert collector_step.nprocs == 1  # was 4, forced back to 1
+
+The same applies to the internal collector that Aqueduct appends automatically when a
+parallel group is the last step — it always runs in a single process.
+
+The restriction only affects the **collecting** step. The parallel branches themselves,
+and any non-collecting step, can still use ``nprocs > 1`` freely:
+
+.. code-block:: python
+
+    flow = Flow(
+        FlowStep(PreprocessHandler(), nprocs=3),   # ok: not a collector
+        [
+            FlowStep(ModelA(), nprocs=2),          # ok: parallel branch
+            FlowStep(ModelB(), nprocs=2),          # ok: parallel branch
+        ],
+        FlowStep(AggregateHandler(), nprocs=4),    # collector -> forced to 1
+    )
+
+If you need the collecting step to scale across processes, split it in two: keep a
+lightweight single-process collector right after the parallel group, then forward to a
+separate heavy step that can use ``nprocs > 1``:
+
+.. code-block:: python
+
+    flow = Flow(
+        [ModelA(), ModelB()],                       # parallel group
+        AggregateHandler(),                         # collector (nprocs == 1)
+        FlowStep(HeavyPostprocessHandler(), nprocs=4),  # scales freely
+    )
+
+
+Zero-copy fan-out
+*****************
+When a task is fanned out to ``N`` branches, by default its payload is pickled and
+copied ``N`` times (once per branch). For large payloads (images, numpy arrays, byte
+buffers) this can dominate the cost of fan-out.
+
+Zero-copy fan-out moves large payload fields into shared memory **once** and sends only
+a lightweight handle to every branch, so the per-branch transfer cost becomes ``O(1)``
+in payload size instead of ``O(N)``. It is controlled by ``Flow`` constructor arguments:
+
+- ``zero_copy_fanout`` - enable zero-copy fan-out. Default is ``False``.
+- ``fanout_min_share_bytes`` - minimum field size (in bytes) worth moving to shared
+  memory. Smaller fields are copied as usual. Defaults to 64 KiB.
+
+.. code-block:: python
+
+    flow = Flow(
+        PreprocessHandler(),
+        [ModelA(), ModelB()],
+        zero_copy_fanout=True,
+    )
+
+.. warning::
+   With zero-copy fan-out enabled, all branches share the **same** underlying buffer
+   for a moved field. Branches must treat such payload fields as **read-only** — an
+   in-place modification in one branch would be visible to the others and cause a data
+   race. If you need to mutate the payload, leave ``zero_copy_fanout`` disabled (the
+   default), so each branch gets an independent copy.
+
+Backwards compatibility: zero-copy is fully optional and falls back to the regular copy
+path whenever a field cannot be shared (no shareable fields, ``numpy`` not installed,
+payload below the threshold, etc.).
+
+
+Metrics
+*******
+Metrics for a fanned-out task are aggregated correctly: work done before the fan-out
+(shared by all branches) is counted once, and each branch's own segment is counted once.
+See `Metrics <metrics.rst>`_ for how to export them.
